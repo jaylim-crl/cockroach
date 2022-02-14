@@ -439,11 +439,21 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 	}()
 
 	// Pass ownership of crdbConn to the forwarder.
-	f = forward(ctx, conn, crdbConn)
+	f, err = forward(ctx, conn, crdbConn)
+	if err != nil {
+		// This case is impossible unless there was a programming error.
+		return err
+	}
 	defer f.Close()
 
 	// Block until an error is received, or when the stopper starts quiescing,
 	// whichever that happens first.
+	//
+	// TODO(jaylim-crl): We should handle all these errors properly, and
+	// propagate them back to the client if we're in a safe position to send.
+	// This PR https://github.com/cockroachdb/cockroach/pull/66205 removed error
+	// injections after connection handoff because there was a possibility of
+	// corrupted packets.
 	select {
 	case err := <-f.errChan: // From forwarder.
 		handler.metrics.updateForError(err)

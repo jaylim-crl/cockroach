@@ -31,7 +31,8 @@ func TestForward(t *testing.T) {
 		// Close the connection right away. p2 is owned by the forwarder.
 		p1.Close()
 
-		f := forward(bgCtx, p1, p2)
+		f, err := forward(bgCtx, p1, p2)
+		require.NoError(t, err)
 		defer f.Close()
 
 		// We have to wait for the goroutine to run. Once the forwarder stops,
@@ -55,7 +56,8 @@ func TestForward(t *testing.T) {
 		// for that.
 		defer clientR.Close()
 
-		f := forward(ctx, clientR, serverW)
+		f, err := forward(ctx, clientR, serverW)
+		require.NoError(t, err)
 		defer f.Close()
 		require.Nil(t, f.ctx.Err())
 
@@ -126,7 +128,8 @@ func TestForward(t *testing.T) {
 		// for that.
 		defer clientR.Close()
 
-		f := forward(ctx, clientR, serverW)
+		f, err := forward(ctx, clientR, serverW)
+		require.NoError(t, err)
 		defer f.Close()
 		require.Nil(t, f.ctx.Err())
 
@@ -179,7 +182,8 @@ func TestForwarder_Close(t *testing.T) {
 	p1, p2 := net.Pipe()
 	defer p1.Close() // p2 is owned by the forwarder.
 
-	f := forward(context.Background(), p1, p2)
+	f, err := forward(context.Background(), p1, p2)
+	require.NoError(t, err)
 	defer f.Close()
 	require.Nil(t, f.ctx.Err())
 
@@ -193,7 +197,8 @@ func TestForwarder_IsStopped(t *testing.T) {
 	p1, p2 := net.Pipe()
 	defer p1.Close() // p2 is owned by the forwarder.
 
-	f := forward(context.Background(), p1, p2)
+	f, err := forward(context.Background(), p1, p2)
+	require.NoError(t, err)
 	defer f.Close()
 	require.Nil(t, f.ctx.Err())
 	require.False(t, f.IsStopped())

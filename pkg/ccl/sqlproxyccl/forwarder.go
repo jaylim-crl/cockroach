@@ -12,8 +12,17 @@ import (
 	"context"
 	"net"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/errors"
 )
+
+// defaultBufferSize is the default buffer size for each of the interceptors
+// created by the forwarder. 8K was chosen to match Postgres' send and receive
+// buffer sizes.
+//
+// See: https://github.com/postgres/postgres/blob/249d64999615802752940e017ee5166e726bc7cd/src/backend/libpq/pqcomm.c#L134-L135.
+const defaultBufferSize = 2 << 13 // 8K
 
 // ErrForwarderClosed indicates that the forwarder has been closed.
 var ErrForwarderClosed = errors.New("forwarder has been closed")
@@ -36,8 +45,27 @@ type forwarder struct {
 	// connection. In the context of a connection migration, serverConn is only
 	// replaced once the session has successfully been deserialized, and the
 	// old connection will be closed.
+	//
+	// All reads from these connections must go through the interceptors. It is
+	// not safe to read from these directly as the interceptors may have
+	// buffered data.
 	clientConn net.Conn // client <-> proxy
 	serverConn net.Conn // proxy <-> server
+
+	// clientInterceptor and serverInterceptor provides a convenient way to
+	// read and forward Postgres messages, while minimizing IO reads and memory
+	// allocations.
+	//
+	// These interceptors have to match clientConn and serverConn. See comment
+	// above on when those fields will be updated.
+	//
+	// TODO(jaylim-crl): Add updater functions that sets both conn and
+	// interceptor fields at the same time. At the moment, there's no use case
+	// besides the forward function. When connection migration happens, we
+	// will need to update the destination for clientInterceptor, and create
+	// a new serverInterceptor.
+	clientInterceptor *interceptor.BackendInterceptor  // clientConn -> serverConn
+	serverInterceptor *interceptor.FrontendInterceptor // serverConn -> clientConn
 
 	// errChan is a buffered channel that contains the first forwarder error.
 	// This channel may receive nil errors.
@@ -59,47 +87,71 @@ type forwarder struct {
 // since we only check on context cancellation there. There could be a
 // possibility where the top-level context was cancelled, but the forwarder
 // has not cleaned up.
-func forward(ctx context.Context, clientConn, serverConn net.Conn) *forwarder {
+func forward(ctx context.Context, clientConn, serverConn net.Conn) (f *forwarder, retErr error) {
+	if clientConn == nil || serverConn == nil {
+		return nil, errors.AssertionFailedf("clientConn and serverConn cannot be nil")
+	}
+
 	ctx, cancelFn := context.WithCancel(ctx)
 
-	f := &forwarder{
+	f = &forwarder{
 		ctx:        ctx,
 		ctxCancel:  cancelFn,
 		clientConn: clientConn,
 		serverConn: serverConn,
 		errChan:    make(chan error, 1),
 	}
-
-	go func() {
-		// Block until context is done.
-		<-f.ctx.Done()
-
-		// Close the forwarder to clean up. This goroutine is temporarily here
-		// because the only way to unblock io.Copy is to close one of the ends,
-		// which will be done through closing the forwarder. Once we replace
-		// io.Copy with the interceptors, we could use f.ctx directly, and no
-		// longer need this goroutine.
-		//
-		// Note that if f.Close was called externally, this will result
-		// in two f.Close calls in total, i.e. one externally, and one here
-		// once the context gets cancelled. This is fine for now since we'll
-		// be removing this soon anyway.
-		f.Close()
+	defer func() {
+		if retErr != nil {
+			f.Close()
+		}
 	}()
+
+	// The net.Conn object for the client is switched to a net.Conn that
+	// unblocks Read every second on idle to check for exit conditions.
+	// This is mainly used to unblock the request processor whenever the
+	// forwarder has stopped, or a transfer has been requested.
+	f.clientConn = pgwire.NewReadTimeoutConn(f.clientConn, func() error {
+		// Context was cancelled.
+		if f.IsStopped() {
+			return f.ctx.Err()
+		}
+		// TODO(jaylim-crl): Check for transfer state here.
+		return nil
+	})
+
+	// Create initial interceptors.
+	var err error
+	f.clientInterceptor, err = interceptor.NewBackendInterceptor(
+		f.clientConn,
+		f.serverConn,
+		defaultBufferSize,
+	)
+	if err != nil {
+		return nil, errors.AssertionFailedf("initializing client interceptor: %v", err)
+	}
+	f.serverInterceptor, err = interceptor.NewFrontendInterceptor(
+		f.serverConn,
+		f.clientConn,
+		defaultBufferSize,
+	)
+	if err != nil {
+		return nil, errors.AssertionFailedf("initializing server interceptor: %v", err)
+	}
 
 	// Copy all pgwire messages from frontend to backend connection until we
 	// encounter an error or shutdown signal.
 	go func() {
 		defer f.Close()
 
-		err := ConnectionCopy(f.serverConn, f.clientConn)
+		err := f.startConnectionCopy()
 		select {
 		case f.errChan <- err: /* error reported */
 		default: /* the channel already contains an error */
 		}
 	}()
 
-	return f
+	return f, nil
 }
 
 // Close closes the forwarder, and stops the forwarding process. This is
@@ -121,4 +173,82 @@ func (f *forwarder) Close() {
 // same pair of connections.
 func (f *forwarder) IsStopped() bool {
 	return f.ctx.Err() != nil
+}
+
+// startConnectionCopy does a bidirectional copy between the backend and
+// frontend connections. It terminates when one of connections terminate.
+func (f *forwarder) startConnectionCopy() error {
+	errOutgoing := make(chan error, 1)
+	errIncoming := make(chan error, 1)
+
+	go func() {
+		// Start request processor.
+		err := f.processClient()
+		errOutgoing <- err
+	}()
+	go func() {
+		// Start response processor.
+		err := f.processServer()
+		errIncoming <- err
+	}()
+
+	select {
+	// NB: when using pgx, we see a nil errIncoming first on clean connection
+	// termination. Using psql I see a nil errOutgoing first. I think the PG
+	// protocol stipulates sending a message to the server at which point the
+	// server closes the connection (errIncoming), but presumably the client
+	// gets to close the connection once it's sent that message, meaning either
+	// case is possible.
+	case err := <-errIncoming:
+		// err cannot be nil, but we'll check anyway. For now, we'll return nil
+		// when we get a context cancellation, but ideally we should return an
+		// AdminShutdown error.
+		if err == nil || errors.Is(err, context.Canceled) {
+			return
+		}
+		if codeErr := (*codeError)(nil); errors.As(err, &codeErr) &&
+			codeErr.code == codeExpiredClientConnection {
+			return codeErr
+		}
+		if ne := (net.Error)(nil); errors.As(err, &ne) && ne.Timeout() {
+			return newErrorf(codeIdleDisconnect, "terminating connection due to idle timeout: %v", err)
+		}
+		return newErrorf(codeBackendDisconnected, "copying from target server to client: %s", err)
+	case err := <-errOutgoing:
+		// err cannot be nil, but we'll check anyway. For now, we'll return nil
+		// when we get a context cancellation, but ideally we should return an
+		// AdminShutdown error.
+		if err == nil || errors.Is(err, context.Canceled) {
+			return
+		}
+		return newErrorf(codeClientDisconnected, "copying from client to target server: %v", err)
+	}
+}
+
+// processClient, also known as request processor, handles the communication
+// from the client to the server. This returns a context cancellation error
+// whenever the forwarder is stopped, or whenever forwarding fails. When
+// ForwardMsg gets blocked, we will unblock that through our custom
+// readTimeoutConn wrapper, which gets triggered when the forwarder is stopped.
+func (f *forwarder) processClient() error {
+	for !f.IsStopped() {
+		if _, err := f.clientInterceptor.ForwardMsg(); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// processServer, also known as response processor, handles the communication
+// from the server to the client. This returns a context cancellation error
+// whenever the forwarder is stopped, or whenever forwarding fails. When
+// ForwardMsg gets blocked, we will unblock that by closing serverConn, which
+// gets triggered when the forwarder is stopped.
+func (f *forwarder) processServer() error {
+	for !f.IsStopped() {
+		if _, err := f.serverInterceptor.ForwardMsg(); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }
