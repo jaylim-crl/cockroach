@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -76,170 +75,70 @@ var waitForShowTransferState = func(
 	//   3. CommandComplete
 	//   4. ReadyForQuery
 
-	// 1. Read RowDescription. Loop here since there could be pipelined queries
-	//    that were sent before.
-	for {
-		if ctx.Err() != nil {
-			return "", "", "", ctx.Err()
-		}
-
-		// We skip reads here so we could call ForwardMsg for messages that are
-		// not our concern.
-		_, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgRowDescription, true /* skipRead */)
-
-		// We don't know if the ErrorResponse is for the client or proxy, so we
-		// will just close the connection.
-		if isErrorResponseError(err) {
-			return "", "", "", errors.Wrap(err, "ambiguous ErrorResponse")
-		}
-
-		// Messages are intended for the client in two cases:
-		// 1. We have not seen a RowDescription message yet
-		// 2. Message was too lage. Connection migration doesn't care about
-		//    large messages since we expected our header for SHOW TRANSFER
-		//    STATE to fit 1 MiB.
-		if isTypeMismatchError(err) || isLargeMessageError(err) {
-			if _, err := serverInterceptor.ForwardMsg(clientConn); err != nil {
-				return "", "", "", errors.Wrap(err, "forwarding message")
+	// 1. Wait for the relevant RowDescription.
+	if err := waitForSmallRowDescription(
+		ctx,
+		serverInterceptor,
+		clientConn,
+		func(msg *pgproto3.RowDescription) bool {
+			// Do we have the right number of columns?
+			if len(msg.Fields) != 4 {
+				return false
 			}
-			continue
-		}
-
-		if err != nil {
-			return "", "", "", errors.Wrap(err, "waiting for RowDescription")
-		}
-
-		msg, err := serverInterceptor.ReadMsg()
-		if err != nil {
-			return "", "", "", errors.Wrap(err, "reading RowDescription")
-		}
-
-		// If pgMsg is nil, isValidStartTransferStateResponse will handle that.
-		pgMsg, _ := msg.(*pgproto3.RowDescription)
-
-		// We found our intended header, so start expecting a DataRow.
-		if isValidStartTransferStateResponse(pgMsg) {
-			break
-		}
-
-		// Column names do not match, so forward the message back to the client,
-		// and continue waiting.
-		if _, err := clientConn.Write(msg.Encode(nil)); err != nil {
-			return "", "", "", errors.Wrap(err, "writing RowDescription")
-		}
+			// Do the names of the columns match?
+			var transferStateCols = []string{
+				"error",
+				"session_state_base64",
+				"session_revival_token_base64",
+				"transfer_key",
+			}
+			for i, col := range transferStateCols {
+				// Prevent an allocation when converting byte slice to string.
+				if encoding.UnsafeString(msg.Fields[i].Name) != col {
+					return false
+				}
+			}
+			return true
+		},
+	); err != nil {
+		return "", "", "", errors.Wrap(err, "waiting for RowDescription")
 	}
 
 	// 2. Read DataRow.
-	{
-		msg, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgDataRow, false /* skipRead */)
-		if err != nil {
-			return "", "", "", errors.Wrap(err, "waiting for DataRow")
+	if err := expectDataRow(ctx, serverInterceptor, func(msg *pgproto3.DataRow) bool {
+		// This has to be 4 since we validated RowDescription earlier.
+		if len(msg.Values) != 4 {
+			return false
 		}
 
-		// If pgMsg is nil, parseTransferStateResponse will handle that.
-		pgMsg, _ := msg.(*pgproto3.DataRow)
-		transferErr, state, revivalToken, err = parseTransferStateResponse(pgMsg, transferKey)
-		if err != nil {
-			return "", "", "", errors.Wrapf(err, "invalid DataRow: %v", jsonOrRaw(msg))
+		// Validate transfer key. It is possible that the end-user uses the SHOW
+		// TRANSFER STATE WITH 'transfer_key' statement, but that isn't designed
+		// for external usage, so it is fine to just terminate here if the
+		// transfer key does not match.
+		if encoding.UnsafeString(msg.Values[3]) != transferKey {
+			return false
 		}
+
+		// NOTE: We have to cast to string and copy here since the slice
+		// referenced in msg will no longer be valid once we read the next pgwire
+		// message.
+		transferErr, state, revivalToken = string(msg.Values[0]), string(msg.Values[1]), string(msg.Values[2])
+		return true
+	}); err != nil {
+		return "", "", "", errors.Wrap(err, "expecting DataRow")
 	}
 
 	// 3. Read CommandComplete.
-	{
-		msg, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgCommandComplete, false /* skipRead */)
-		if err != nil {
-			return "", "", "", errors.Wrap(err, "waiting for CommandComplete")
-		}
-
-		// If pgMsg is nil, isValidEndTransferStateResponse will handle that.
-		pgMsg, _ := msg.(*pgproto3.CommandComplete)
-		if !isValidEndTransferStateResponse(pgMsg) {
-			return "", "", "", errors.Newf("invalid CommandComplete: %v", jsonOrRaw(msg))
-		}
+	if err := expectCommandComplete(ctx, serverInterceptor, "SHOW TRANSFER STATE 1"); err != nil {
+		return "", "", "", errors.Wrap(err, "expecting CommandComplete")
 	}
 
 	// 4. Read ReadyForQuery.
-	if _, err := expectNextServerMessage(
-		ctx, serverInterceptor, pgwirebase.ServerMsgReady, false /* skipRead */); err != nil {
-		return "", "", "", errors.Wrap(err, "waiting for ReadyForQuery")
+	if err := expectReadyForQuery(ctx, serverInterceptor); err != nil {
+		return "", "", "", errors.Wrap(err, "expecting ReadyForQuery")
 	}
 
 	return transferErr, state, revivalToken, nil
-}
-
-// isValidStartTransferStateResponse returns true if m represents a valid
-// column header for the SHOW TRANSFER STATE statement, or false otherwise.
-func isValidStartTransferStateResponse(m *pgproto3.RowDescription) bool {
-	if m == nil {
-		return false
-	}
-	// Do we have the right number of columns?
-	if len(m.Fields) != 4 {
-		return false
-	}
-	// Do the names of the columns match?
-	var transferStateCols = []string{
-		"error",
-		"session_state_base64",
-		"session_revival_token_base64",
-		"transfer_key",
-	}
-	for i, col := range transferStateCols {
-		// Prevent an allocation when converting byte slice to string.
-		if encoding.UnsafeString(m.Fields[i].Name) != col {
-			return false
-		}
-	}
-	return true
-}
-
-// isValidEndTransferStateResponse returns true if this is a valid
-// CommandComplete message that denotes the end of a transfer state response
-// message, or false otherwise.
-func isValidEndTransferStateResponse(m *pgproto3.CommandComplete) bool {
-	if m == nil {
-		return false
-	}
-	// We only expect 1 response row.
-	return encoding.UnsafeString(m.CommandTag) == "SHOW TRANSFER STATE 1"
-}
-
-// parseTransferStateResponse parses the state in the DataRow message, and
-// extracts the fields for the SHOW TRANSFER STATE query. If err != nil, then
-// all other returned fields will be empty strings.
-//
-// If the input transferKey does not match the result for the transfer_key
-// column within the DataRow message, this will return an error.
-func parseTransferStateResponse(
-	m *pgproto3.DataRow, transferKey string,
-) (transferErr string, state string, revivalToken string, err error) {
-	if m == nil {
-		return "", "", "", errors.New("DataRow message is nil")
-	}
-
-	// Do we have the right number of columns? This has to be 4 since we have
-	// validated RowDescription earlier.
-	if len(m.Values) != 4 {
-		return "", "", "", errors.Newf(
-			"unexpected %d columns in DataRow", len(m.Values))
-	}
-
-	// Validate transfer key. It is possible that the end-user uses the SHOW
-	// TRANSFER STATE WITH 'transfer_key' statement, but that isn't designed for
-	// external usage, so it is fine to just terminate here if the transfer key
-	// does not match.
-	keyVal := encoding.UnsafeString(m.Values[3])
-	if keyVal != transferKey {
-		return "", "", "", errors.Newf(
-			"expected '%s' as transfer key, found '%s'", transferKey, keyVal)
-	}
-
-	// NOTE: We have to cast to string and copy here since the slice referenced
-	// in m will no longer be valid once we read the next pgwire message.
-	return string(m.Values[0]), string(m.Values[1]), string(m.Values[2]), nil
 }
 
 // runAndWaitForDeserializeSession deserializes state into the SQL pod through
@@ -276,54 +175,35 @@ var runAndWaitForDeserializeSession = func(
 	//   2. DataRow
 	//   3. CommandComplete
 	//   4. ReadyForQuery
-	const skipRead = false
 
 	// 1. Read RowDescription.
-	{
-		msg, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgRowDescription, skipRead)
-		if err != nil {
-			return errors.Wrap(err, "waiting for RowDescription")
-		}
-		pgMsg, ok := msg.(*pgproto3.RowDescription)
-		if !ok || len(pgMsg.Fields) != 1 ||
-			encoding.UnsafeString(pgMsg.Fields[0].Name) != "crdb_internal.deserialize_session" {
-			return errors.Newf("invalid RowDescription: %v", jsonOrRaw(msg))
-		}
+	if err := waitForSmallRowDescription(
+		ctx,
+		serverInterceptor,
+		io.Discard,
+		func(msg *pgproto3.RowDescription) bool {
+			return len(msg.Fields) == 1 &&
+				encoding.UnsafeString(msg.Fields[0].Name) != "crdb_internal.deserialize_session"
+		},
+	); err != nil {
+		return errors.Wrap(err, "expecting RowDescription")
 	}
 
 	// 2. Read DataRow.
-	{
-		msg, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgDataRow, skipRead)
-		if err != nil {
-			return errors.Wrap(err, "waiting for DataRow")
-		}
-		// Expect just 1 column with "true" as value.
-		pgMsg, ok := msg.(*pgproto3.DataRow)
-		if !ok || len(pgMsg.Values) != 1 ||
-			encoding.UnsafeString(pgMsg.Values[0]) != "t" {
-			return errors.Newf("invalid DataRow: %v", jsonOrRaw(msg))
-		}
+	if err := expectDataRow(ctx, serverInterceptor, func(msg *pgproto3.DataRow) bool {
+		return len(msg.Values) == 1 && encoding.UnsafeString(msg.Values[0]) == "t"
+	}); err != nil {
+		return errors.Wrap(err, "expecting DataRow")
 	}
 
 	// 3. Read CommandComplete.
-	{
-		msg, err := expectNextServerMessage(
-			ctx, serverInterceptor, pgwirebase.ServerMsgCommandComplete, skipRead)
-		if err != nil {
-			return errors.Wrap(err, "waiting for CommandComplete")
-		}
-		pgMsg, ok := msg.(*pgproto3.CommandComplete)
-		if !ok || encoding.UnsafeString(pgMsg.CommandTag) != "SELECT 1" {
-			return errors.Newf("invalid CommandComplete: %v", jsonOrRaw(msg))
-		}
+	if err := expectCommandComplete(ctx, serverInterceptor, "SELECT 1"); err != nil {
+		return errors.Wrap(err, "expecting CommandComplete")
 	}
 
 	// 4. Read ReadyForQuery.
-	if _, err := expectNextServerMessage(
-		ctx, serverInterceptor, pgwirebase.ServerMsgReady, skipRead); err != nil {
-		return errors.Wrap(err, "waiting for ReadyForQuery")
+	if err := expectReadyForQuery(ctx, serverInterceptor); err != nil {
+		return errors.Wrap(err, "expecting ReadyForQuery")
 	}
 
 	return nil
@@ -336,83 +216,150 @@ func writeQuery(w io.Writer, format string, a ...interface{}) error {
 	return err
 }
 
-// expectNextServerMessage expects that the next message in the server's
-// interceptor will match the input message type. This will block until one
-// message can be peeked. On return, this reads the next message into memory,
-// and returns that. To avoid this read behavior, set skipRead to true, so the
-// caller can decide what to do with the next message (i.e. if skipRead=true,
-// retMsg=nil).
+// waitForSmallRowDescription waits until the next message from the interceptor
+// is a *small* RowDescription message (i.e. within 4K bytes), and one that
+// passes matchFn. When that happens, this returns nil.
 //
-// retMsg != nil if there is a type mismatch, or the message cannot fit within
-// 1 MiB. Use isTypeMismatchError or isLargeMessageError to detect such
-// errors.
-//
-// TODO(jaylim-crl): This function is causing some confusion. Attempt to refactor
-// this again. Ideally, the maxBodySize of 1 MiB is only used for the DataRow
-// message, and everything else should be small (e.g. 4kb). For RowDescription,
-// this is used to forward messages back to the client, whereas for all other
-// messages, this is used to abort the connection since an invariant has failed.
-func expectNextServerMessage(
+// For all other messages (i.e. non RowDescription or large messages), they will
+// be forwarded to conn. One exception to this would be the ErrorResponse
+// message, which will result in an error since we're in an ambiguous state.
+// The ErrorResponse message may be for a pipelined query, or the RowDescription
+// message that we're waiting.
+func waitForSmallRowDescription(
 	ctx context.Context,
 	interceptor *interceptor.FrontendInterceptor,
-	msgType pgwirebase.ServerMessageType,
-	skipRead bool,
-) (retMsg pgproto3.BackendMessage, retErr error) {
-	// Limit messages for connection transfers to 1 MiB. If we decide that we
-	// need more, we could lift this restriction.
-	//
-	// TODO(jaylim-crl): Move this to a TenantReadOnly cluster setting within
-	// the database.
-	const maxBodySize = 1 << 20 // 1 MiB
+	conn io.Writer,
+	matchFn func(*pgproto3.RowDescription) bool,
+) error {
+	// Since we're waiting for the first message that matches the given
+	// condition, we're going to loop here until we find one.
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 
+		typ, size, err := interceptor.PeekMsg()
+		if err != nil {
+			return errors.Wrap(err, "peeking message")
+		}
+
+		// We don't know if the ErrorResponse is for the expected RowDescription
+		// or a previous pipelined query, so return an error.
+		if typ == pgwirebase.ServerMsgErrorResponse {
+			// Error messages are small, so read for debugging purposes.
+			msg, err := interceptor.ReadMsg()
+			if err != nil {
+				return errors.Wrap(err, "ambiguous ErrorResponse")
+			}
+			return errors.Newf("ambiguous ErrorResponse: %v", jsonOrRaw(msg))
+		}
+
+		// Messages are intended for the client in two cases:
+		//   1. We have not seen a RowDescription message yet
+		//   2. Message was too large. This function only expects a few columns.
+		//
+		// This is mostly an optimization, and there's no point reading such
+		// messages into memory, so we'll just forward them back to the client
+		// right away.
+		const maxSmallMsgSize = 1 << 12 // 4KB
+		if typ != pgwirebase.ServerMsgRowDescription || size > maxSmallMsgSize {
+			if _, err := interceptor.ForwardMsg(conn); err != nil {
+				return errors.Wrap(err, "forwarding message")
+			}
+			continue
+		}
+
+		msg, err := interceptor.ReadMsg()
+		if err != nil {
+			return errors.Wrap(err, "reading RowDescription")
+		}
+
+		pgMsg, ok := msg.(*pgproto3.RowDescription)
+		if !ok {
+			return errors.Newf("invalid message: %v", jsonOrRaw(msg))
+		}
+
+		// We have found our desired RowDescription.
+		if matchFn(pgMsg) {
+			return nil
+		}
+
+		// Matching fails, so forward the message back to the client, and
+		// continue searching.
+		if _, err := conn.Write(msg.Encode(nil)); err != nil {
+			return errors.Wrap(err, "writing message")
+		}
+	}
+}
+
+// expectDataRow expects that the next message from the interceptor is a DataRow
+// message. If the next message is a DataRow message, validateFn will be called
+// to validate the contents. This function will return an error if we don't see
+// a DataRow message or the validation failed.
+//
+// WARNING: Use this with care since this reads the entire message into memory.
+// Unlike the other expectX methods, DataRow messages may be large, and this
+// does not check for that. We are currently only using this for the SHOW
+// TRANSFER and crdb_internal.deserialize_session() statements, and they both
+// have been vetted. The former's size will be guarded behind a cluster setting,
+// whereas for the latter, the response is expected to be small.
+func expectDataRow(
+	ctx context.Context,
+	interceptor *interceptor.FrontendInterceptor,
+	validateFn func(*pgproto3.DataRow) bool,
+) error {
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
-
-	typ, size, err := interceptor.PeekMsg()
-	if err != nil {
-		return nil, errors.Wrap(err, "peeking message")
-	}
-
-	if msgType != typ {
-		return nil, errors.Newf("type mismatch: expected '%c', but found '%c'", msgType, typ)
-	}
-
-	if size > maxBodySize {
-		return nil, errors.Newf("too many bytes: expected <= %d, but found %d", maxBodySize, size)
-	}
-
-	if skipRead {
-		return nil, nil
-	}
-
 	msg, err := interceptor.ReadMsg()
 	if err != nil {
-		return nil, errors.Wrap(err, "reading message")
+		return errors.Wrap(err, "reading message")
 	}
-	return msg, nil
+	pgMsg, ok := msg.(*pgproto3.DataRow)
+	if !ok {
+		return errors.Newf("invalid message: %v", jsonOrRaw(msg))
+	}
+	if !validateFn(pgMsg) {
+		return errors.Newf("validation failed for message: %v", jsonOrRaw(msg))
+	}
+	return nil
 }
 
-// isErrorResponseError returns true if the error is a type mismatch due to
-// matching an ErrorResponse pgwire message, and false otherwise. err must come
-// from expectNextServerMessage.
-func isErrorResponseError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "type mismatch") &&
-		strings.Contains(err.Error(), fmt.Sprintf("found '%c'", pgwirebase.ServerMsgErrorResponse))
+// expectCommandComplete expects that the next message from the interceptor is
+// a CommandComplete message with the input tag, and returns an error if it
+// isn't.
+func expectCommandComplete(
+	ctx context.Context, interceptor *interceptor.FrontendInterceptor, tag string,
+) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	msg, err := interceptor.ReadMsg()
+	if err != nil {
+		return errors.Wrap(err, "reading message")
+	}
+	pgMsg, ok := msg.(*pgproto3.CommandComplete)
+	if !ok || encoding.UnsafeString(pgMsg.CommandTag) != tag {
+		return errors.Newf("invalid message: %v", jsonOrRaw(msg))
+	}
+	return nil
 }
 
-// isTypeMismatchError returns true if the error represents a type mismatch
-// error, and false otherwise. err must come from expectNextServerMessage.
-func isTypeMismatchError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "type mismatch")
-}
-
-// isLargeMessageError returns true if the error stems from "too many bytes",
-// and false otherwise. This error will be returned if the message has more
-// than 1 MiB. Connection migration does not care about such large messages.
-// err must come from expectNextServerMessage.
-func isLargeMessageError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "too many bytes")
+// expectReadyForQuery expects that the next message from the interceptor is a
+// ReadyForQuery message, and returns an error if it isn't.
+func expectReadyForQuery(ctx context.Context, interceptor *interceptor.FrontendInterceptor) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	msg, err := interceptor.ReadMsg()
+	if err != nil {
+		return errors.Wrap(err, "reading message")
+	}
+	_, ok := msg.(*pgproto3.ReadyForQuery)
+	if !ok {
+		return errors.Newf("invalid message: %v", jsonOrRaw(msg))
+	}
+	return nil
 }
 
 // jsonOrRaw returns msg in a json string representation if it can be marshaled
