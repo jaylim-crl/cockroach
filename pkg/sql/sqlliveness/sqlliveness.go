@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,10 +32,48 @@ import (
 // may not be a well-formed UTF8 string.
 type SessionID string
 
+func MakeSessionID(region []byte) SessionID {
+	// version byte, region length byte, region bytes, uuid bytes
+	// 1 + 1 + len(region) + 16
+	sessionLength := 1 + 1 + len(region) + uuid.Size
+	b := make([]byte, 0, sessionLength)
+	b = append(b, 1)                           // version
+	b = append(b, byte(len(region)))           // region length
+	b = append(b, region...)                   // region bytes
+	b = append(b, uuid.MakeV4().GetBytes()...) // uuid bytes
+	return SessionID(b)
+}
+
+// TODO(jaylim-crl): revisit parsing logic, maybe Read{Byte,Short,etc}?
+func UnsafeParseSessionID(s SessionID) (region, u []byte, err error) {
+	b := s.UnsafeBytes()
+
+	if len(b) < uuid.Size {
+		return nil, nil, errors.New("TODO: malformed session ID")
+	}
+
+	// Legacy format of SessionID.
+	if len(b) == uuid.Size {
+		return nil, b, nil
+	}
+
+	// Version check.
+	if b[0] != 1 {
+		return nil, nil, errors.New("TODO: invalid version")
+	}
+
+	regionLen := int(b[1])
+	if len(b) != 2+regionLen+uuid.Size {
+		return nil, nil, errors.New("TODO: malformed session ID")
+	}
+
+	return b[2 : 2+regionLen], b[2+regionLen:], nil
+}
+
 // Provider is a wrapper around the sqllivness subsystem for external
 // consumption.
 type Provider interface {
-	Start(ctx context.Context)
+	Start(ctx context.Context, region []byte)
 	Metrics() metric.Struct
 	Liveness
 

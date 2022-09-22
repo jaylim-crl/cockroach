@@ -12,6 +12,7 @@ package slstorage
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -284,7 +285,10 @@ func (s *Storage) deleteOrFetchSession(
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		deleted = false
-		k := s.makeSessionKey(sid)
+		k, err := s.makeSessionKey(sid)
+		if err != nil {
+			return err
+		}
 		kv, err := txn.Get(ctx, k)
 		if err != nil {
 			return err
@@ -397,7 +401,26 @@ func (s *Storage) deleteExpiredSessions(ctx context.Context) {
 func (s *Storage) Insert(
 	ctx context.Context, sid sqlliveness.SessionID, expiration hlc.Timestamp,
 ) (err error) {
-	k := s.makeSessionKey(sid)
+	k, err := s.makeSessionKey(sid)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("KEY: %v\n", k)
+
+	// a, b
+	// 1, 2
+
+	// /Table/100/1/a -> 1
+	// /Table/100/1/b -> 2
+
+	// Tenant/2/Table/39/1/<UUID> -> expiration
+	// session_id, expiration
+
+	// Tenant/2/Table/39/2/<region>/<UUID> -> expiration
+	// region, session_uuid, expiration
+	// (region, session_uuid)
+
 	v := encodeValue(expiration)
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	if err := s.db.InitPut(ctx, k, &v, true); err != nil {
@@ -416,7 +439,10 @@ func (s *Storage) Update(
 ) (sessionExists bool, err error) {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	err = s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		k := s.makeSessionKey(sid)
+		k, err := s.makeSessionKey(sid)
+		if err != nil {
+			return err
+		}
 		kv, err := txn.Get(ctx, k)
 		if err != nil {
 			return err
@@ -456,11 +482,20 @@ func (s *cachedStorage) IsAlive(
 }
 
 func (s *Storage) makeTablePrefix() roachpb.Key {
-	return s.codec.IndexPrefix(uint32(s.tableID), 1)
+	return s.codec.IndexPrefix(uint32(s.tableID), 2)
 }
 
-func (s *Storage) makeSessionKey(id sqlliveness.SessionID) roachpb.Key {
-	return keys.MakeFamilyKey(encoding.EncodeBytesAscending(s.makeTablePrefix(), id.UnsafeBytes()), 0)
+// TODO(jaylim-crl): Handle migration case.
+// - maybe read and write from two different indexes?
+func (s *Storage) makeSessionKey(id sqlliveness.SessionID) (roachpb.Key, error) {
+	region, u, err := sqlliveness.UnsafeParseSessionID(id)
+	if err != nil {
+		return nil, err
+	}
+	key := s.makeTablePrefix()
+	key = encoding.EncodeBytesAscending(key, region)
+	key = encoding.EncodeBytesAscending(key, u)
+	return keys.MakeFamilyKey(key, 0), nil
 }
 
 func decodeValue(kv kv.KeyValue) (hlc.Timestamp, error) {

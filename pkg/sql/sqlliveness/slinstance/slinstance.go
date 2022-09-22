@@ -16,6 +16,7 @@ package slinstance
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -28,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 var (
@@ -130,6 +130,7 @@ type Instance struct {
 		syncutil.Mutex
 		blockCh chan struct{}
 		s       *session
+		region  []byte
 	}
 }
 
@@ -164,8 +165,9 @@ func (l *Instance) clearSession(ctx context.Context) {
 
 // createSession tries until it can create a new session and returns an error
 // only if the heart beat loop should exit.
-func (l *Instance) createSession(ctx context.Context) (*session, error) {
-	id := sqlliveness.SessionID(uuid.MakeV4().GetBytes())
+func (l *Instance) createSession(ctx context.Context, region []byte) (*session, error) {
+	id := sqlliveness.MakeSessionID(region)
+	fmt.Println(id)
 	start := l.clock.Now()
 	exp := start.Add(l.ttl().Nanoseconds(), 0)
 	s := &session{
@@ -237,7 +239,7 @@ func (l *Instance) extendSession(ctx context.Context, s *session) (bool, error) 
 	return true, nil
 }
 
-func (l *Instance) heartbeatLoop(ctx context.Context) {
+func (l *Instance) heartbeatLoop(ctx context.Context, region []byte) {
 	defer func() {
 		log.Warning(ctx, "exiting heartbeat loop")
 	}()
@@ -253,7 +255,7 @@ func (l *Instance) heartbeatLoop(ctx context.Context) {
 			t.Read = true
 			s, _ := l.getSessionOrBlockCh()
 			if s == nil {
-				newSession, err := l.createSession(ctx)
+				newSession, err := l.createSession(ctx, region)
 				if err != nil {
 					func() {
 						l.mu.Lock()
@@ -318,14 +320,17 @@ func NewSQLInstance(
 }
 
 // Start runs the hearbeat loop.
-func (l *Instance) Start(ctx context.Context) {
+func (l *Instance) Start(ctx context.Context, region []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.mu.started {
 		return
 	}
+	// l.mu.region = region
 	log.Infof(ctx, "starting SQL liveness instance")
-	_ = l.stopper.RunAsyncTask(ctx, "slinstance", l.heartbeatLoop)
+	_ = l.stopper.RunAsyncTask(ctx, "slinstance", func(ctx context.Context) {
+		l.heartbeatLoop(ctx, region)
+	})
 	l.mu.started = true
 }
 

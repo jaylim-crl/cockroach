@@ -1188,7 +1188,8 @@ func (s *SQLServer) startSQLLivenessAndInstanceProviders(ctx context.Context) er
 			return err
 		}
 	}
-	s.sqlLivenessProvider.Start(ctx)
+	// XXX TODO(jaylim-crl):
+	s.sqlLivenessProvider.Start(ctx, []byte("FOO-REGION"))
 	// sqlInstanceProvider must always be started after sqlLivenessProvider
 	// as sqlInstanceProvider relies on the session initialized and maintained by
 	// sqlLivenessProvider.

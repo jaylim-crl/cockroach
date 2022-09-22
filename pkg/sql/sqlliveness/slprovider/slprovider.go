@@ -45,9 +45,9 @@ func New(
 	}
 }
 
-func (p *provider) Start(ctx context.Context) {
+func (p *provider) Start(ctx context.Context, region []byte) {
 	p.Storage.Start(ctx)
-	p.Instance.Start(ctx)
+	p.Instance.Start(ctx, region)
 }
 
 func (p *provider) Metrics() metric.Struct {
