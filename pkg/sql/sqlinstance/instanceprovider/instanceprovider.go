@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -34,6 +35,12 @@ import (
 type writer interface {
 	CreateInstance(ctx context.Context, sessionID sqlliveness.SessionID, sessionExpiration hlc.Timestamp, instanceAddr string, locality roachpb.Locality) (base.SQLInstanceID, error)
 	ReleaseInstanceID(ctx context.Context, instanceID base.SQLInstanceID) error
+	RunAsyncAllocateAndCleanup(
+		ctx context.Context,
+		stopper *stop.Stopper,
+		ts timeutil.TimeSource,
+		session sqlliveness.Session,
+	) error
 }
 
 // provider implements the sqlinstance.Provider interface for access to the
@@ -163,6 +170,13 @@ func (p *provider) initialize(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "constructing session")
 	}
+
+	if err := p.storage.RunAsyncAllocateAndCleanup(
+		ctx, p.stopper, timeutil.DefaultTimeSource{}, session,
+	); err != nil {
+		return errors.Wrap(err, "running async allocator and cleanup job")
+	}
+
 	instanceID, err := p.storage.CreateInstance(ctx, session.ID(), session.Expiration(), p.instanceAddr, p.locality)
 	if err != nil {
 		return err

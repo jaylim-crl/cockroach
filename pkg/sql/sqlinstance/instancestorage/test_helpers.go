@@ -20,7 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // FakeStorage implements the instanceprovider.storage interface.
@@ -67,6 +69,12 @@ func (f *FakeStorage) ReleaseInstanceID(_ context.Context, id base.SQLInstanceID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.mu.instances, id)
+	return nil
+}
+
+func (s *FakeStorage) RunAsyncAllocateAndCleanup(
+	ctx context.Context, stopper *stop.Stopper, ts timeutil.TimeSource, session sqlliveness.Session,
+) error {
 	return nil
 }
 
