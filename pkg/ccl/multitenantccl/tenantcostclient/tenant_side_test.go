@@ -766,7 +766,7 @@ func TestWaitingRU(t *testing.T) {
 
 	// Immediately consume the initial 10K RUs.
 	require.NoError(t, ctrl.OnResponseWait(ctx,
-		tenantcostmodel.TestingRequestInfo(1, 1, 10237952), tenantcostmodel.ResponseInfo{}))
+		tenantcostmodel.TestingRequestInfo(1, 1, 10237952, "", ""), tenantcostmodel.ResponseInfo{}))
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -784,8 +784,8 @@ func TestWaitingRU(t *testing.T) {
 	// Send 20 KV requests for 1K RU each.
 	const count = 20
 	const fillRate = 100
-	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952)
-	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0)
+	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952, "", "")
+	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0, "", "")
 
 	testutils.SucceedsSoon(t, func() error {
 		tenantcostclient.TestingSetRate(ctrl, fillRate)
