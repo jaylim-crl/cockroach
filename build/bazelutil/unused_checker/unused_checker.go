@@ -128,7 +128,7 @@ func logUsage(in map[string]*[]string, out *Usage) {
 
 func ignoreUnused(obj string) bool {
 	prefixes := []string{
-		"github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl.",
+		// "github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl.",
 		"github.com/cockroachdb/cockroach/pkg/geo/geographiclib.",
 		"github.com/cockroachdb/cockroach/pkg/util/goschedstats.",
 		"github.com/cockroachdb/cockroach/pkg/sql/parser.",
