@@ -144,10 +144,14 @@ var authenticate = func(
 		// Server has authenticated the connection successfully and is ready to
 		// serve queries.
 		case *pgproto3.ReadyForQuery:
-			if err = feSend(backendMsg); err != nil {
+			if err = feSend(toPgError(connectionsLimitedError)); err != nil {
 				return nil, err
 			}
-			return crdbBackendKeyData, nil
+			return nil, connectionsLimitedError
+			// if err = feSend(backendMsg); err != nil {
+			// 	return nil, err
+			// }
+			// return crdbBackendKeyData, nil
 
 		default:
 			return nil, withCode(

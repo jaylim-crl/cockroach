@@ -261,6 +261,8 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 
 	// SNI provides tenant ID.
 	url = fmt.Sprintf("postgres://bob:builder@tenant-cluster-28.blah:%s/defaultdb?sslmode=require", port)
+	fmt.Println(url)
+	time.Sleep(10 * time.Minute)
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
 		require.NoError(t, runTestQuery(ctx, conn))

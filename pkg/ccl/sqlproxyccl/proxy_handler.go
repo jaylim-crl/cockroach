@@ -55,6 +55,15 @@ var (
 	clusterNameRegex = regexp.MustCompile("^[a-z0-9][a-z0-9-]{4,98}[a-z0-9]$")
 )
 
+const resourceLimitedErrorHint string = `Connection limiting is triggered by insufficient resource limits. Make
+sure the cluster has not hit its request unit and storage limits.
+`
+
+var connectionsLimitedError = errors.WithHint(
+	withCode(errors.New("connection attempt limited"), codeProxyRefusedConnection),
+	resourceLimitedErrorHint,
+)
+
 const (
 	// Cluster identifier is in the form "<cluster name>-<tenant id>. Tenant ID
 	// is always in the end but the cluster name can also contain '-' or digits.
@@ -456,42 +465,45 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn net.Conn) 
 		writeErrMarker: errClientWrite,
 	}
 
-	// Pass ownership of conn and crdbConn to the forwarder.
-	if err := f.run(clientConn, crdbConn); err != nil {
-		// Don't send to the client here for the same reason below.
-		handler.metrics.updateForError(err)
-		return errors.Wrap(err, "running forwarder")
-	}
+	SendErrToClient(clientConn, connectionsLimitedError)
+	return errors.New("exit")
 
-	// Block until an error is received, or when the stopper starts quiescing,
-	// whichever that happens first.
-	//
-	// TODO(jaylim-crl): We should handle all these errors properly, and
-	// propagate them back to the client if we're in a safe position to send.
-	// This PR https://github.com/cockroachdb/cockroach/pull/66205 removed error
-	// injections after connection handoff because there was a possibility of
-	// corrupted packets.
-	//
-	// TODO(jaylim-crl): It would be nice to have more consistency in how we
-	// manage background goroutines, communicate errors, etc.
-	select {
-	case <-ctx.Done():
-		// Context cancellations do not terminate forward() so we will need
-		// to manually handle that here. When this returns, we would call
-		// f.Close(). This should only happen during shutdown.
-		handler.metrics.updateForError(ctx.Err())
-		return ctx.Err()
-	case err := <-f.errCh: // From forwarder.
-		handler.metrics.updateForError(err)
-		return err
-	case err := <-errConnection: // From denyListWatcher.
-		handler.metrics.updateForError(err)
-		return err
-	case <-handler.stopper.ShouldQuiesce():
-		err := context.Canceled
-		handler.metrics.updateForError(err)
-		return err
-	}
+	// // Pass ownership of conn and crdbConn to the forwarder.
+	// if err := f.run(clientConn, crdbConn); err != nil {
+	// 	// Don't send to the client here for the same reason below.
+	// 	handler.metrics.updateForError(err)
+	// 	return errors.Wrap(err, "running forwarder")
+	// }
+
+	// // Block until an error is received, or when the stopper starts quiescing,
+	// // whichever that happens first.
+	// //
+	// // TODO(jaylim-crl): We should handle all these errors properly, and
+	// // propagate them back to the client if we're in a safe position to send.
+	// // This PR https://github.com/cockroachdb/cockroach/pull/66205 removed error
+	// // injections after connection handoff because there was a possibility of
+	// // corrupted packets.
+	// //
+	// // TODO(jaylim-crl): It would be nice to have more consistency in how we
+	// // manage background goroutines, communicate errors, etc.
+	// select {
+	// case <-ctx.Done():
+	// 	// Context cancellations do not terminate forward() so we will need
+	// 	// to manually handle that here. When this returns, we would call
+	// 	// f.Close(). This should only happen during shutdown.
+	// 	handler.metrics.updateForError(ctx.Err())
+	// 	return ctx.Err()
+	// case err := <-f.errCh: // From forwarder.
+	// 	handler.metrics.updateForError(err)
+	// 	return err
+	// case err := <-errConnection: // From denyListWatcher.
+	// 	handler.metrics.updateForError(err)
+	// 	return err
+	// case <-handler.stopper.ShouldQuiesce():
+	// 	err := context.Canceled
+	// 	handler.metrics.updateForError(err)
+	// 	return err
+	// }
 }
 
 // handleCancelRequest handles a pgwire query cancel request by either
