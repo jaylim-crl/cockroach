@@ -80,7 +80,15 @@ func TestTenantMetadataUpdate(t *testing.T) {
 	require.False(t, e.IsValid())
 
 	// Use an old version.
-	e.UpdateTenant(&Tenant{Version: "002"})
+	ten := &Tenant{
+		Version:          "002",
+		PrivateEndpoints: []string{"a", "b"},
+	}
+	e.UpdateTenant(ten)
 	require.True(t, e.IsValid())
 	require.Equal(t, "002", e.mu.tenant.Version)
+
+	// Validate that the object is copy-on-write
+	ten.PrivateEndpoints[0] = "foo-bar"
+	require.Equal(t, []string{"a", "b"}, e.mu.tenant.PrivateEndpoints)
 }
