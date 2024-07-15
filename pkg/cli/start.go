@@ -503,7 +503,14 @@ func runStartInternal(
 	if fl := fs.Lookup(cliflags.TenantIDFile.Name); fl != nil && fl.Changed {
 		fileName := fl.Value.String()
 		serverCfg.DelayedSetTenantID = func(ctx context.Context) (roachpb.TenantID, error) {
-			return tenantIDFromFile(ctx, fileName, nil, nil, nil)
+			tenantID, err := tenantIDFromFile(ctx, fileName, nil, nil, nil)
+			if err != nil {
+				return roachpb.TenantID{}, err
+			}
+			if err := tryReadLocalityFileFlag(fs); err != nil {
+				return roachpb.TenantID{}, err
+			}
+			return tenantID, nil
 		}
 	}
 
