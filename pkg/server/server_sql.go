@@ -12,6 +12,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -526,6 +527,9 @@ func (r *refreshInstanceSessionListener) OnSessionDeleted(
 // listening to the server's serverctl.ShutdownRequested() channel (which is the same as
 // cfg.stopTrigger.C()) and stopping cfg.stopper when signaled.
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
+	fmt.Println("locality via args")
+	fmt.Println(cfg.Locality)
+
 	// NB: ValidateAddrs also fills in defaults.
 	if err := cfg.Config.ValidateAddrs(ctx); err != nil {
 		return nil, err
@@ -1490,6 +1494,9 @@ func (s *SQLServer) preStart(
 	if err := s.settingsWatcher.Start(ctx); err != nil {
 		return errors.Wrap(err, "initializing settings")
 	}
+
+	fmt.Println("LOCALITY - server_sql.go")
+	fmt.Println(s.distSQLServer.Locality)
 
 	// Load the multi-region enum by reading the system database's descriptor.
 	// This also serves as a simple check to see if a tenant exist (i.e. by
