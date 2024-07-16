@@ -502,18 +502,18 @@ func runStartInternal(
 	// Check the --tenant-id-file flag.
 	if fl := fs.Lookup(cliflags.TenantIDFile.Name); fl != nil && fl.Changed {
 		fileName := fl.Value.String()
-		serverCfg.DelayedSetTenantID = func(ctx context.Context) (roachpb.TenantID, error) {
+		serverCfg.DelayedSetTenantID = func(ctx context.Context) (roachpb.TenantID, roachpb.Locality, error) {
 			tenantID, err := tenantIDFromFile(ctx, fileName, nil, nil, nil)
 			if err != nil {
-				return roachpb.TenantID{}, err
+				return roachpb.TenantID{}, roachpb.Locality{}, err
 			}
 			fmt.Println("READING LOCALITY")
 			fmt.Println(serverCfg.Locality)
 			if err := tryReadLocalityFileFlag(fs); err != nil {
-				return roachpb.TenantID{}, err
+				return roachpb.TenantID{}, roachpb.Locality{}, err
 			}
 			fmt.Println(serverCfg.Locality)
-			return tenantID, nil
+			return tenantID, serverCfg.Locality, nil
 		}
 	}
 
