@@ -507,9 +507,12 @@ func runStartInternal(
 			if err != nil {
 				return roachpb.TenantID{}, err
 			}
+			fmt.Println("READING LOCALITY")
+			fmt.Println(serverCfg.Locality)
 			if err := tryReadLocalityFileFlag(fs); err != nil {
 				return roachpb.TenantID{}, err
 			}
+			fmt.Println(serverCfg.Locality)
 			return tenantID, nil
 		}
 	}
