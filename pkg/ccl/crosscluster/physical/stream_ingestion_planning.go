@@ -101,9 +101,18 @@ func ingestionPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	_, _, sourceTenant, err := exprEval.TenantSpec(ctx, ingestionStmt.ReplicationSourceTenantName)
+	_, sourceTenantID, sourceTenantName, err := exprEval.TenantSpec(ctx, ingestionStmt.ReplicationSourceTenantName)
 	if err != nil {
 		return nil, nil, nil, false, err
+	}
+
+	// If sourceTenantID is provided, lookup the name based on its ID.
+	if sourceTenantName == "" {
+		info, err := sql.GetTenantRecordByID(ctx, p.InternalSQLTxn(), sourceTenantID, p.ExecCfg().Settings)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		sourceTenantName = info.Name
 	}
 
 	_, dstTenantID, dstTenantName, err := exprEval.TenantSpec(ctx, ingestionStmt.TenantSpec)
