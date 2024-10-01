@@ -108,11 +108,11 @@ func ingestionPlanHook(
 
 	// If sourceTenantID is provided, lookup the name based on its ID.
 	if sourceTenantName == "" {
-		if sourceTenantID == 0 {
-			return nil, nil, nil, false, pgerror.Newf(pgcode.InsufficientPrivilege,
-				"xxx - invalid tenant ID")
+		srcTenantID, err := roachpb.MakeTenantID(sourceTenantID)
+		if err != nil {
+			return nil, nil, nil, false, err
 		}
-		info, err := sql.GetTenantRecordByID(ctx, p.InternalSQLTxn(), roachpb.TenantID(sourceTenantID), p.ExecCfg().Settings)
+		info, err := sql.GetTenantRecordByID(ctx, p.InternalSQLTxn(), srcTenantID, p.ExecCfg().Settings)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
