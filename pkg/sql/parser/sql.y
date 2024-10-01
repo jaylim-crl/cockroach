@@ -4703,46 +4703,46 @@ logical_replication_options:
 // %Help: CREATE VIRTUAL CLUSTER - create a new virtual cluster
 // %Category: Experimental
 // %Text:
-// CREATE VIRTUAL CLUSTER [ IF NOT EXISTS ] name [ LIKE <virtual_cluster_spec> ] [ <replication> ]
+// CREATE VIRTUAL CLUSTER [ IF NOT EXISTS ] virtual_cluster_spec [ LIKE <virtual_cluster_spec> ] [ <replication> ]
 //
 // Replication option:
 //    FROM REPLICATION OF <virtual_cluster_spec> ON <location> [ WITH OPTIONS ... ]
 create_virtual_cluster_stmt:
-  CREATE virtual_cluster d_expr opt_like_virtual_cluster
+  CREATE virtual_cluster virtual_cluster_spec opt_like_virtual_cluster
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
+      TenantSpec: $3.tenantSpec(),
       Like: $4.likeTenantSpec(),
     }
   }
-| CREATE virtual_cluster IF NOT EXISTS d_expr opt_like_virtual_cluster
+| CREATE virtual_cluster IF NOT EXISTS virtual_cluster_spec opt_like_virtual_cluster
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
       IfNotExists: true,
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $6.expr()},
+      TenantSpec: $6.tenantSpec(),
       Like: $7.likeTenantSpec(),
     }
   }
-| CREATE virtual_cluster d_expr opt_like_virtual_cluster FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
+| CREATE virtual_cluster virtual_cluster_spec opt_like_virtual_cluster FROM REPLICATION OF virtual_cluster_spec ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
-      ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $8.expr()},
+      TenantSpec: $3.tenantSpec(),
+      ReplicationSourceTenantName: $8.tenantSpec(),
       ReplicationSourceAddress: $10.expr(),
       Options: *$11.tenantReplicationOptions(),
       Like: $4.likeTenantSpec(),
     }
   }
-| CREATE virtual_cluster IF NOT EXISTS d_expr opt_like_virtual_cluster FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
+| CREATE virtual_cluster IF NOT EXISTS virtual_cluster_spec opt_like_virtual_cluster FROM REPLICATION OF virtual_cluster_spec ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
       IfNotExists: true,
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $6.expr()},
-      ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $11.expr()},
+      TenantSpec: $6.tenantSpec(),
+      ReplicationSourceTenantName: $11.tenantSpec(),
       ReplicationSourceAddress: $13.expr(),
       Options: *$14.tenantReplicationOptions(),
       Like: $7.likeTenantSpec(),

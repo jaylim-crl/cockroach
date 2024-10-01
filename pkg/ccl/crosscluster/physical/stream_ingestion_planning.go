@@ -107,9 +107,22 @@ func ingestionPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	_, _, sourceTenant, err := exprEval.TenantSpec(ctx, ingestionStmt.ReplicationSourceTenantName)
+	_, sourceTenantID, sourceTenantName, err := exprEval.TenantSpec(ctx, ingestionStmt.ReplicationSourceTenantName)
 	if err != nil {
 		return nil, nil, nil, false, err
+	}
+
+	// If sourceTenantID is provided, lookup the name based on its ID.
+	if sourceTenantName == "" {
+		srcTenantID, err := roachpb.MakeTenantID(sourceTenantID)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		info, err := sql.GetTenantRecordByID(ctx, p.InternalSQLTxn(), srcTenantID, p.ExecCfg().Settings)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		sourceTenantName = string(info.Name)
 	}
 
 	_, dstTenantID, dstTenantName, err := exprEval.TenantSpec(ctx, ingestionStmt.TenantSpec)
@@ -216,7 +229,7 @@ func ingestionPlanHook(
 			ctx,
 			p,
 			streamAddress,
-			sourceTenant,
+			sourceTenantName,
 			destinationTenantID,
 			retentionTTLSeconds,
 			options.resumeTimestamp,
